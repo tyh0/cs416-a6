@@ -1,0 +1,217 @@
+/*
+
+A trivial client to illustrate how the kvservice library can be used
+from an application in assignment 6 for UBC CS 416 2016 W2.
+
+Usage:
+go run client.go
+*/
+
+package main
+
+// Expects kvservice.go to be in the ./kvservice/ dir, relative to
+// this client.go file
+import (
+	"fmt"
+	"os"
+
+	"./common"
+	"./kvservice"
+)
+
+func main() {
+	fmt.Println("***** Starting Test Client")
+	singleValueSuccessTxn("cat", "meow")
+	startAndAbortTxn("cat", "purr")
+	overwriteExistingKVPair("cat", "scratch fever")
+	addMultipleValues("currentAssignment", "Prof", "6", "Ivan")
+	testSequential()
+}
+
+func singleValueSuccessTxn(k kvservice.Key, v kvservice.Value) {
+	nodes := common.GetNodes(os.Args[1])
+	c := kvservice.NewConnection(nodes)
+	fmt.Printf("***** singleValueSuccessTxn - NewConnection returned: %v\n", c)
+
+	t, err := c.NewTX()
+	fmt.Printf("***** singleValueSuccessTxn - NewTX returned: %v, %v\n", t, err)
+
+	success, err := t.Put(k, v)
+	fmt.Printf("***** singleValueSuccessTxn - Put returned: %v, %v\n", success, err)
+
+	success, val, err := t.Get(k)
+	fmt.Printf("***** singleValueSuccessTxn - Get returned: %v, %v, %v\n", success, v, err)
+	if val != v {
+		fmt.Printf("XX _ XX startAndAbortTxn - something went wrong!")
+	}
+	success, txID, err := t.Commit()
+	fmt.Printf("***** singleValueSuccessTxn - Commit returned: %v, %v, %v\n", success, txID, err)
+
+	c.Close()
+}
+
+func startAndAbortTxn(k kvservice.Key, val kvservice.Value) {
+	nodes := common.GetNodes(os.Args[1])
+	c := kvservice.NewConnection(nodes)
+	fmt.Printf("***** startAndAbortTxn - NewConnection returned: %v\n", c)
+	// create a Transaction
+	t, err := c.NewTX()
+	fmt.Printf("***** startAndAbortTxn - NewTX returned: %v, %v\n", t, err)
+
+	// get original value of k
+	success, v_prev, err := t.Get(k)
+	fmt.Printf("***** startAndAbortTxn - Get returned: %v, %v, %v\n", success, v_prev, err)
+
+	// Put - k:val
+	success, err = t.Put(k, val)
+	fmt.Printf("***** startAndAbortTxn - Put returned: %v, %v\n", success, err)
+
+	// Get - k:v_post
+	success, v, err := t.Get(k)
+	if v != val {
+		fmt.Printf("***** startAndAbortTxn - Get returned: %v, Expected: %v\n", v, val)
+	}
+	fmt.Printf("***** startAndAbortTxn - Get returned: %v, %v, %v\n", success, v, err)
+
+	// abort transaction ==> result of k should revert to kprev
+	t.Abort()
+	fmt.Printf("***** startAndAbortTxn - Transaction aborted\n")
+
+	// create new transaction
+	t2, err := c.NewTX()
+	fmt.Printf("***** startAndAbortTxn - NewConnection returned: %v\n", c)
+
+	// Get value of k
+	success, v, err = t2.Get(k)
+	fmt.Printf("***** startAndAbortTxn - Get 2 returned: %v, %v, %v\n", success, v, err)
+
+	if v != v_prev || v == val {
+		fmt.Printf("XX _ XX startAndAbortTxn - End result was not original value")
+	}
+	success, txID, err := t2.Commit()
+
+	fmt.Printf("***** startAndAbortTxn - Commit returned: %v, %v, %v\n", success, txID, err)
+
+	c.Close()
+
+}
+
+func overwriteExistingKVPair(k kvservice.Key, val kvservice.Value) {
+	nodes := common.GetNodes(os.Args[1])
+	c := kvservice.NewConnection(nodes)
+	fmt.Printf("***** overwriteExistingKVPair - NewConnection returned: %v\n", c)
+	// create a Transaction
+	t, err := c.NewTX()
+	fmt.Printf("***** overwriteExistingKVPair - NewTX returned: %v, %v\n", t, err)
+
+	// Do a get on the key to see if key:value already exists
+	success, v, err := t.Get(k)
+	fmt.Printf("***** overwriteExistingKVPair - Get returned: %v, %v, %v\n", success, v, err)
+	if v == val {
+		fmt.Printf("***** overwriteExistingKVPair - key:value pair already exists")
+	}
+	// Put - key:val
+	success, err = t.Put(k, val)
+	fmt.Printf("***** overwriteExistingKVPair - Put returned: %v, %v\n", success, err)
+
+	success, txID, err := t.Commit()
+
+	// create new transaction
+	t2, err := c.NewTX()
+	fmt.Printf("***** overwriteExistingKVPair - NewConnection returned: %v\n", c)
+
+	// Get - key:val and ensure it was updated correctly
+	success, v, err = t2.Get(k)
+	fmt.Printf("***** overwriteExistingKVPair - Get 2 returned: %v, %v, %v\n", success, v, err)
+
+	// if returned value is not expected val, something went wrong
+	if v != val {
+		fmt.Printf("XX _ XX overwriteExistingKVPair - something went wrong!")
+	}
+	success, txID, err = t2.Commit()
+
+	fmt.Printf("***** overwriteExistingKVPair - Commit returned: %v, %v, %v\n", success, txID, err)
+
+	c.Close()
+
+}
+
+func addMultipleValues(k1, k2 kvservice.Key, v1, v2 kvservice.Value) {
+	nodes := common.GetNodes(os.Args[1])
+	c := kvservice.NewConnection(nodes)
+	fmt.Printf("***** addMultipleValues - NewConnection returned: %v\n", c)
+	// create new transaction
+	t, err := c.NewTX()
+	fmt.Printf("***** addMultipleValues - NewTX returned: %v, %v\n", t, err)
+	// put k1:v1
+	success, err := t.Put(k1, v1)
+	fmt.Printf("***** addMultipleValues - Put k1 returned: %v, %v\n", success, err)
+	// get k1:v1 and ensure it exists pre-commit
+	success, v, err := t.Get(k1)
+	fmt.Printf("***** addMultipleValues - Get k1 returned: %v, %v, %v\n", success, v, err)
+	if v != v1 {
+		fmt.Printf("XX _ XX addMultipleValues - something went wrong!")
+	}
+	// put k2:v2
+	success, err = t.Put(k2, v2)
+	fmt.Printf("***** addMultipleValues - Put k2 returned: %v, %v\n", success, err)
+	// get k2:v2 and ensure it exists pre-commit
+	success, v, err = t.Get(k2)
+	fmt.Printf("***** addMultipleValues - Get k2 returned: %v, %v, %v\n", success, v, err)
+	if v != v2 {
+		fmt.Printf("XX _ XX addMultipleValues - something went wrong!")
+	}
+	// commit tx
+	success, txID, err := t.Commit()
+	fmt.Printf("***** addMultipleValues - Commit returned: %v, %v, %v\n", success, txID, err)
+
+	// create new transaction
+	t2, err := c.NewTX()
+	fmt.Printf("***** addMultipleValues - NewConnection returned: %v\n", c)
+	// get k1 and ensure it persists past commit
+	success, v, err = t2.Get(k1)
+	fmt.Printf("***** addMultipleValues - Get 3 returned: %v, %v, %v\n", success, v, err)
+	if v != v1 {
+		fmt.Printf("XX _ XX addMultipleValues - something went wrong!")
+	}
+	// get k2 and ensure it persists past commit
+	success, v, err = t2.Get(k2)
+	fmt.Printf("***** addMultipleValues - Get 4 returned: %v, %v, %v\n", success, v, err)
+	if v != v2 {
+		fmt.Printf("XX _ XX addMultipleValues - something went wrong!")
+	}
+
+	success, txID, err = t2.Commit()
+
+	c.Close()
+}
+
+func testSequential() {
+	nodes := common.GetNodes(os.Args[1])
+	c := kvservice.NewConnection(nodes)
+	fmt.Printf("***** testSequential - NewConnection returned: %v\n", c)
+
+	t1, err := c.NewTX()
+	fmt.Printf("***** testSequential - NewTX T1 returned: %v, %v\n", t1, err)
+
+	t2, err := c.NewTX()
+	fmt.Printf("***** testSequential - NewTX T2 returned: %v, %v\n", t2, err)
+
+	success, err := t1.Put("apples", "red")
+
+	// TODO: Seems to hang here. Deadlock not being resolved?
+	fmt.Printf("***** testSequential - T1 Put returned: %v, %v\n", success, err)
+
+	success, val, err := t2.Get("apples")
+	fmt.Printf("***** testSequential - T2 Get returned: %v, %v, %v\n", success, val, err)
+	if val != "red" {
+		fmt.Printf("XX _ XX testSequential - something went wrong!")
+	}
+	success, txID, err := t1.Commit()
+	fmt.Printf("***** testSequential - T1 Commit returned: %v, %v, %v\n", success, txID, err)
+
+	success, txID, err = t2.Commit()
+	fmt.Printf("***** testSequential - T2 Commit returned: %v, %v, %v\n", success, txID, err)
+
+	c.Close()
+}

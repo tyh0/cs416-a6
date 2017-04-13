@@ -1,0 +1,545 @@
+/*
+
+An example stub implementation of the kvservice interface for use by a
+client to access the key-value service in assignment 6 for UBC CS 416
+2016 W2.
+
+*/
+
+package kvservice
+
+import (
+	"errors"
+	"log"
+	"net"
+	"net/rpc"
+	"os"
+	"sort"
+	"sync"
+	"time"
+
+	"../common"
+)
+
+// Represents a key in the system.
+type Key string
+
+// Represent a value in the system.
+type Value string
+
+// An interface representing a connection to the key-value store. To
+// create a new connection use the NewConnection() method.
+type Connection interface {
+	// The 'constructor' for a new logical transaction object. This is the
+	// only way to create a new transaction. The returned transaction must
+	// correspond to a specific, reachable, node in the k-v service. If
+	// none of the nodes are reachable then tx must be nil and error must
+	// be set (non-nil).
+	NewTX() (newTX tx, err error)
+
+	// Close the connection.
+	Close()
+}
+
+// An interface representing a client's transaction. To create a new
+// transaction use the connection.NewTX() method.
+type tx interface {
+	// Retrieves a value v associated with a key k as part of this
+	// transaction. If success is true then v contains the value
+	// associated with k and err is nil. If success is false then the
+	// tx has aborted, v is nil, and err is non-nil. If success is
+	// false, then all future calls on this transaction must
+	// immediately return success = false (indicating an earlier
+	// abort).
+	Get(k Key) (success bool, v Value, err error)
+
+	// Associates a value v with a key k as part of this
+	// transaction. If success is true then put was recoded
+	// successfully, otherwise the transaction has aborted (see
+	// above).
+	Put(k Key, v Value) (success bool, err error)
+
+	// Commits this transaction. If success is true then commit
+	// succeeded, otherwise the transaction has aborted (see above).
+	// txID represents the transactions's global sequence number
+	// (which determines this transaction's position in the serialized
+	// sequence of all the other transactions executed by the
+	// service).
+	Commit() (success bool, txID int, err error)
+
+	// Aborts this transaction. This call always succeeds.
+	Abort()
+}
+
+//////////////////////////////////////////////
+
+var (
+	nodelist          []string
+	serviceLogger     *log.Logger
+	currentConnection *myconn
+	currentConnMutex  sync.Mutex
+)
+
+// The 'constructor' for a new logical connection object. This is the
+// only way to create a new connection. Takes a set of k-v service
+// node ip:port strings.
+func NewConnection(nodes []string) Connection {
+	serviceLogger = log.New(os.Stderr, "[KVService] ", log.Lshortfile)
+	serviceLogger.Printf("NewConnection\n")
+	c := new(myconn)
+	// a list of TCPAddr's corresponding to each input worker
+	c.client_addrs = make(map[string]*net.TCPAddr)
+	// Currently a list of TCP Connections corresponding to each input worker
+	c.client_worker_rpc_clients = make(map[string]*rpc.Client)
+	var err error
+	sort.Strings(nodes)
+	serviceLogger.Printf("Current list of nodes: %v", nodes)
+	// set client's internal record of nodes to the sorted node list
+	nodelist = nodes
+	serviceLogger.Print("Initializing client_addrs and client_worker_connections")
+	for _, ipstring := range nodelist {
+		log.Println("trying ", ipstring)
+		// resolve each worker ip:port string
+		c.client_addrs[ipstring], err = net.ResolveTCPAddr("tcp", ipstring)
+
+		checkServiceError("Error resolving TCPAddr: ", err, false)
+		// dial a connecetion for each worker ip:port string
+		//c.client_worker_connections[ipstring], err = net.Dial("tcp", ipstring)
+		//checkServiceError("Error dialing worker ip:port", err, false)
+		c.client_worker_rpc_clients[ipstring], err = rpc.Dial("tcp", ipstring)
+		if err != nil {
+			serviceLogger.Printf("Error creating RPC connection to %v%n", ipstring)
+			// c.client_worker_rpc_clients[ipstring] = nil
+			checkServiceError("Error creating RPC Client: ", err, false)
+
+			continue
+		}
+		serviceLogger.Printf("Successfully dialed RPC client for %v. Client: %v", ipstring, c.client_worker_rpc_clients[ipstring])
+	}
+
+	// find current Master node
+	currentConnMutex.Lock()
+	c.ManagerClient, err = c.findMasterNode()
+	if err != nil {
+		serviceLogger.Println("Error returned from findMasterNode in NewConnection")
+	}
+	currentConnection = c
+	currentConnMutex.Unlock()
+	return c
+}
+
+//////////////////////////////////////////////
+// Connection interface
+
+// Concrete implementation of a connection interface.
+type myconn struct {
+	client_addrs              map[string]*net.TCPAddr
+	client_worker_rpc_clients map[string]*rpc.Client
+	ManagerClient             *rpc.Client
+}
+
+// Create a new transaction.
+// currently assuming that TxID's are only generated on a
+// single client, and as such they increase linearly based
+// on a global variable created only on this client
+func (conn *myconn) NewTX() (tx, error) {
+	serviceLogger.Printf("NewTX\n")
+	m := new(mytx)
+	m.txDone = make(chan bool)
+	var reply bool
+
+	// find RPC client corresponding to master node
+	currentConnMutex.Lock()
+	err := currentConnection.ManagerClient.Call("KVNode.Heartbeat", 0, &reply)
+	currentConnMutex.Unlock()
+	if err != nil {
+		currentConnMutex.Lock()
+		currentConnection.ManagerClient, err = currentConnection.findMasterNode()
+		if err != nil {
+			serviceLogger.Println("In NewTX, error returned from findMasterNode")
+		}
+		currentConnMutex.Unlock()
+	}
+	if err != nil {
+		// TODO: May need to test for nil Manager Clients here again
+		checkServiceError("NewTX: ", err, false)
+	} else {
+		m.TxID, err = conn.createNewTX()
+		checkServiceError("NewTx: ", err, false)
+		go m.monitorHeartbeat(m.txDone)
+	}
+	return m, nil
+}
+
+func (conn *myconn) createNewTX() (int, error) {
+	var TxID int
+	var err error
+	var fakevar struct{}
+	currentConnMutex.Lock()
+	err = currentConnection.ManagerClient.Call("KVNode.NewTransaction", fakevar, &TxID)
+	currentConnMutex.Unlock()
+	if TxID == 0 || err != nil {
+		err = errors.New("CreateNewTx: KVNode did not reply with a valid TxID")
+	}
+	return TxID, err
+}
+
+// Close the connection.
+func (conn *myconn) Close() {
+	// TODO: Test this more
+	serviceLogger.Printf("Close\n")
+	for k, client := range conn.client_worker_rpc_clients {
+		if client == nil {
+			serviceLogger.Printf("Client for %v is already nil\n", k)
+			continue
+		} else {
+			serviceLogger.Printf("Closing client for %v\n", k)
+			client.Close()
+		}
+	}
+	serviceLogger.Println("Checking if conn.ManagerClient needs to be closed")
+	if conn.ManagerClient != nil {
+		serviceLogger.Println("Closing ManagerClient")
+		conn.ManagerClient.Close()
+	}
+}
+
+// /Connection interface
+//////////////////////////////////////////////
+
+//////////////////////////////////////////////
+// Transaction interface
+
+// Concrete implementation of a tx interface.
+type mytx struct {
+	// TODO
+	TxID     int
+	Commands []TxCmd
+	Owner    string
+	txDone   chan bool
+}
+
+// representation of an individual transaction command
+type TxCmd struct {
+	Key   Key    // type key as declared above
+	Value Value  // type value as declared above
+	Cmd   string // either get or put. Commit and abort handled using function calls
+}
+
+// // Retrieves a value v associated with a key k.
+// func (t *mytx) Get(k Key) (success bool, v Value, err error) {
+// 	serviceLogger.Printf("Get\n")
+// 	// TODO
+// 	var Args common.CmdRequest
+// 	var Reply string
+// 	Args.TXID = t.TxID
+// 	Args.Key = string(k)
+
+// 	err = currentConnection.checkManagerClient()
+// 	if err != nil {
+// 		checkServiceError("Get: ", err, false)
+// 	} else {
+// 		currentConnection.ManagerClient.Call("KVNode.Get", Args, &Reply)
+// 		if Reply == "" {
+// 			v = ""
+// 			err = errors.New("KVNode.Get did not populate the reply")
+// 		} else {
+// 			success = true
+// 			v = Value(Reply)
+// 		}
+// 		// perform a tx.Get operation
+// 		checkServiceError("Get: ", err, false)
+// 	}
+// 	// TODO: Change this return value to be something real
+// 	return success, v, err
+// }
+
+// Retrieves a value v associated with a key k.
+func (t *mytx) Get(k Key) (success bool, v Value, err error) {
+	serviceLogger.Printf("Get\n")
+	// TODO
+	var Args common.CmdRequest
+	var Reply string
+	Args.TXID = t.TxID
+	Args.Key = string(k)
+	currentConnMutex.Lock()
+	err = currentConnection.ManagerClient.Call("KVNode.Get", Args, &Reply)
+	if err != nil {
+		serviceLogger.Println("Error calling KVNode.Get", err)
+	}
+	currentConnMutex.Unlock()
+	if Reply == "" {
+		v = ""
+		err = errors.New("KVNode.Get did not populate the reply")
+	} else {
+		success = true
+		v = Value(Reply)
+	}
+	// perform a tx.Get operation
+	checkServiceError("Get: ", err, false)
+
+	// TODO: Change this return value to be something real
+	return success, v, err
+}
+
+// // Associates a value v with a key k.
+// func (t *mytx) Put(k Key, v Value) (success bool, err error) {
+// 	serviceLogger.Printf("Put\n")
+// 	err = currentConnection.checkManagerClient()
+// 	if err != nil {
+// 		checkServiceError("Put: ", err, false)
+// 	} else {
+// 		// perform a tx.put operation
+// 		var Args common.CmdRequest
+// 		Args.TXID = t.TxID
+// 		Args.Key = string(k)
+// 		Args.Value = string(v)
+// 		var Reply bool
+// 		err = currentConnection.ManagerClient.Call("KVNode.Put", Args, &Reply)
+// 		log.Println("result from put: ", err)
+// 		if Reply == false {
+// 			if err == nil {
+// 				err = errors.New("KVNode.Put: KVNode did not return true")
+// 			}
+// 		}
+// 		success = Reply
+// 		checkServiceError("Put: ", err, false)
+// 	}
+// 	return success, err
+// }
+
+// Associates a value v with a key k.
+func (t *mytx) Put(k Key, v Value) (success bool, err error) {
+	serviceLogger.Printf("Put\n")
+
+	// perform a tx.put operation
+	var Args common.CmdRequest
+	Args.TXID = t.TxID
+	Args.Key = string(k)
+	Args.Value = string(v)
+	var Reply bool
+	currentConnMutex.Lock()
+	err = currentConnection.ManagerClient.Call("KVNode.Put", Args, &Reply)
+	currentConnMutex.Unlock()
+	log.Println("result from put: ", err)
+	if Reply == false {
+		if err == nil {
+			err = errors.New("KVNode.Put: KVNode did not return true")
+		}
+	}
+	success = Reply
+	checkServiceError("Put: ", err, false)
+
+	return success, err
+}
+
+// // Commits the transaction.
+// func (t *mytx) Commit() (success bool, txID int, err error) {
+// 	serviceLogger.Printf("Commit\n")
+// 	// TODO
+// 	err = currentConnection.checkManagerClient()
+// 	if err != nil {
+// 		checkServiceError("Commit: ", err, false)
+// 	} else {
+// 		// do transaction commit
+// 		var Reply int
+// 		currentConnection.ManagerClient.Call("KVNode.Commit", t.TxID, &Reply)
+// 		if Reply == 0 {
+// 			err = errors.New("KVNode.Commit: Did not return a valid TxID Reply")
+// 		} else {
+// 			success = true
+// 			txID = Reply
+// 		}
+// 		checkServiceError("Commit: ", err, false)
+// 	}
+// 	return success, txID, err
+// }
+
+// Commits the transaction.
+func (t *mytx) Commit() (success bool, txID int, err error) {
+	serviceLogger.Printf("Commit\n")
+	// do transaction commit
+	var Reply int
+	currentConnMutex.Lock()
+	currentConnection.ManagerClient.Call("KVNode.Commit", t.TxID, &Reply)
+	currentConnMutex.Unlock()
+	if Reply == 0 {
+		err = errors.New("KVNode.Commit: Did not return a valid TxID Reply")
+	} else {
+		t.txDone <- true
+		success = true
+		txID = Reply
+	}
+	checkServiceError("Commit: ", err, false)
+	return success, txID, err
+}
+
+// // Aborts the transaction.
+// func (t *mytx) Abort() {
+// 	serviceLogger.Printf("Abort\n")
+// 	// TODO
+// 	err := currentConnection.checkManagerClient()
+// 	if err != nil {
+// 		checkServiceError("Commit: ", err, false)
+// 	} else {
+// 		var Reply bool
+// 		currentConnection.ManagerClient.Call("KVNode.Abort", t.TxID, &Reply)
+// 		if Reply == false {
+// 			err = errors.New("KVNode.Abort: Did not return true for Reply")
+// 			// how best to handle an abort that isn't confirmed to have been aborted?
+// 			// possibly just recall the function?
+// 		}
+// 		checkServiceError("Abort: ", err, false)
+// 	}
+// 	return success, txID, err
+// }
+
+// // Aborts the transaction.
+// func (t *mytx) Abort() {
+// 	serviceLogger.Printf("Abort\n")
+// 	// TODO
+// 	err := currentConnection.checkManagerClient()
+// 	if err != nil {
+// 		checkServiceError("Commit: ", err, false)
+// 	} else {
+// 		var Reply bool
+// 		currentConnection.ManagerClient.Call("KVNode.Abort", t.TxID, &Reply)
+// 		if Reply == false {
+// 			err = errors.New("KVNode.Abort: Did not return true for Reply")
+// 			// how best to handle an abort that isn't confirmed to have been aborted?
+// 			// possibly just recall the function?
+// 		}
+// 		checkServiceError("Abort: ", err, false)
+// 	}
+// }
+
+// Aborts the transaction.
+func (t *mytx) Abort() {
+	var err error
+	serviceLogger.Printf("Abort\n")
+	var Reply bool
+	currentConnMutex.Lock()
+	currentConnection.ManagerClient.Call("KVNode.Abort", t.TxID, &Reply)
+	currentConnMutex.Unlock()
+	if Reply == false {
+		err = errors.New("KVNode.Abort: Did not return true for Reply")
+		// how best to handle an abort that isn't confirmed to have been aborted?
+		// possibly just recall the function?
+	}
+	t.txDone <- true
+	checkServiceError("Abort: ", err, false)
+}
+
+// /Transaction interface
+//////////////////////////////////////////////
+
+// func (c *myconn) checkManagerClient() error {
+// 	serviceLogger.Printf("Checking current ManagerClient\n")
+// 	var Result bool
+// 	var err error
+// 	if c.ManagerClient == nil {
+// 		err = errors.New("checkManagerClient: currentManagerClient is not properly initialized")
+// 		return err
+// 	}
+// 	err = currentConnection.ManagerClient.Call("KVNode.Heartbeat", 0, &Result)
+// 	if err == nil {
+// 		return nil
+// 	} else {
+// 		log.Println("Heartbeat error: ", err, "got: ", Result)
+// 		// find the first working KVNode who will respond to RPC call
+// 		for i, _ := range nodelist {
+// 			// call the heartbeat function on each KVNode client
+// 			// starting with worker 0 and working through to higher IPs
+// 			// in sorted order
+// 			err = currentConnection.client_worker_rpc_clients[nodelist[i]].Call("KVNode.Heartbeat", 0, &Result)
+// 			if err == nil {
+// 				// got a response from a client
+// 				// update conn's currentManagerClient
+// 				currentConnection.ManagerClient = currentConnection.client_worker_rpc_clients[nodelist[i]]
+// 				return err
+// 			}
+// 		}
+// 		// if we reached here, none of the workers are responding via RPC
+// 		serviceLogger.Print("No KVNodes are responding via RPC")
+// 		err = errors.New("checkManagerClient: No worker RPC clients are responding")
+// 		return err
+// 	}
+// }
+
+func (c *myconn) findMasterNode() (*rpc.Client, error) {
+	ManagerFound := false
+	var Fakevar struct{}
+	var err error
+	serviceLogger.Println("About to find Master node")
+	serviceLogger.Printf("Currently know of %v nodes\n", len(c.client_worker_rpc_clients))
+	for {
+		serviceLogger.Println("About to loop through clients to find master")
+		for k, client := range c.client_worker_rpc_clients {
+			serviceLogger.Printf("Trying to find master. Current RPC Client - k:%v, v:%v%n", k, client)
+			if client == nil {
+				serviceLogger.Println("Client was nil")
+				continue
+			}
+			serviceLogger.Println("Client was not nil")
+			serviceLogger.Printf("Checking client for k = %v, client = %v\n", k, client)
+			err = client.Call("KVNode.IsMaster", Fakevar, &ManagerFound)
+			if err != nil {
+				// this client may have died
+				// TODO: May have to remove this one
+				serviceLogger.Printf("Error calling KVNode.IsMaster on %v", k)
+				continue
+			}
+			checkServiceError("findMasterNode: ", err, false)
+			serviceLogger.Printf("Finished calling KVNode.IsMaster. ManagerFound = %v", ManagerFound)
+			if ManagerFound == true {
+				serviceLogger.Printf("Found master node: %v", client)
+				return client, err
+			}
+		}
+	}
+	// return nil
+}
+
+func (t *mytx) monitorHeartbeat(txdone chan bool) {
+	// every 0.5 seconds
+	// send a heartbeat
+	// if response takes longer than 4s, assume master is dead
+	// 		then find another master and assign it to the global vars
+	// continue running
+	// when transaction is done, done will be signalled to break the loop
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	// timeout := make(chan bool, 1)
+	var err error
+	var Reply bool
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				currentConnMutex.Lock()
+				err = currentConnection.ManagerClient.Call("KVNode.Heartbeat", t.TxID, &Reply)
+				currentConnMutex.Unlock()
+				if err != nil {
+					currentConnMutex.Lock()
+					currentConnection.ManagerClient, err = currentConnection.findMasterNode()
+					if err != nil {
+						serviceLogger.Println("In MonitorHeartbeat - findMasterNode returned error")
+					}
+					currentConnMutex.Unlock()
+				}
+			case <-txdone:
+				serviceLogger.Println("Current transaction has completed. Stopping heartbeat")
+				return
+			}
+		}
+	}()
+}
+
+func checkServiceError(msg string, err error, exit bool) {
+	if err != nil {
+		serviceLogger.Println(msg, err)
+		if exit {
+			os.Exit(-1)
+		}
+	}
+}
